@@ -151,7 +151,7 @@
  * The resulting threshold is high enough to not be triggered by background
  * noise and low enough to react quickly when activity starts to ramp up.
  */
-#define UTIL_THRESHOLD_SHIFT 5
+#define UTIL_THRESHOLD_SHIFT 6
 
 /*
  * The PULSE value is added to metrics when they grow and the DECAY_SHIFT value
