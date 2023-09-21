@@ -32,6 +32,10 @@
 #include <drm/drm_print.h>
 #include <drm/drm_writeback.h>
 #include <linux/sync_file.h>
+#include <linux/cpu_input_boost.h>
+#include <linux/devfreq_boost.h>
+#include <linux/pm_qos.h>
+#include <linux/sched/sysctl.h>
 
 #include "drm_crtc_internal.h"
 #include "drm_internal.h"
@@ -91,6 +95,12 @@ drm_atomic_state_init(struct drm_device *dev, struct drm_atomic_state *state)
 	if (!state->planes)
 		goto fail;
 
+	/*
+	 * Because drm_atomic_state can be committed asynchronously we need our
+	 * own reference and cannot rely on the on implied by drm_file in the
+	 * ioctl call.
+	 */
+	drm_dev_get(dev);
 	state->dev = dev;
 
 	DRM_DEBUG_ATOMIC("Allocated atomic state %p\n", state);
@@ -250,7 +260,8 @@ EXPORT_SYMBOL(drm_atomic_state_clear);
 void __drm_atomic_state_free(struct kref *ref)
 {
 	struct drm_atomic_state *state = container_of(ref, typeof(*state), ref);
-	struct drm_mode_config *config = &state->dev->mode_config;
+	struct drm_device *dev = state->dev;
+	struct drm_mode_config *config = &dev->mode_config;
 
 	drm_atomic_state_clear(state);
 
@@ -262,6 +273,8 @@ void __drm_atomic_state_free(struct kref *ref)
 		drm_atomic_state_default_release(state);
 		kfree(state);
 	}
+
+	drm_dev_put(dev);
 }
 EXPORT_SYMBOL(__drm_atomic_state_free);
 
@@ -2556,8 +2569,8 @@ static void complete_signaling(struct drm_device *dev,
 	kfree(fence_state);
 }
 
-int drm_mode_atomic_ioctl(struct drm_device *dev,
-			  void *data, struct drm_file *file_priv)
+static int __drm_mode_atomic_ioctl(struct drm_device *dev, void *data,
+				   struct drm_file *file_priv)
 {
 	struct drm_mode_atomic *arg = data;
 	uint32_t __user *objs_ptr = (uint32_t __user *)(unsigned long)(arg->objs_ptr);
@@ -2596,6 +2609,14 @@ int drm_mode_atomic_ioctl(struct drm_device *dev,
 	if ((arg->flags & DRM_MODE_ATOMIC_TEST_ONLY) &&
 			(arg->flags & DRM_MODE_PAGE_FLIP_EVENT))
 		return -EINVAL;
+
+	/* Boost CPU and DDR when committing a new frame if sched_boost > 0 */
+	if (!(arg->flags & DRM_MODE_ATOMIC_TEST_ONLY) &&
+			sysctl_sched_boost) {
+		cpu_input_boost_kick();
+		devfreq_boost_kick(DEVFREQ_CPU_LLCC_DDR_BW);
+		devfreq_boost_kick(DEVFREQ_CPU_CPU_LLCC_BW);
+	}
 
 	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
 
@@ -2710,6 +2731,28 @@ out:
 
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+}
+
+int drm_mode_atomic_ioctl(struct drm_device *dev, void *data,
+			  struct drm_file *file_priv)
+{
+	/*
+	 * Optimistically assume the current task won't migrate to another CPU
+	 * and restrict the current CPU to shallow idle states so that it won't
+	 * take too long to finish running the ioctl whenever the ioctl runs a
+	 * command that sleeps, such as for an "atomic" commit.
+	 */
+	struct pm_qos_request req = {
+		.type = PM_QOS_REQ_AFFINE_CORES,
+		.cpus_affine = ATOMIC_INIT(BIT(raw_smp_processor_id()))
+	};
+	int ret;
+
+	pm_qos_add_request(&req, PM_QOS_CPU_DMA_LATENCY, 100);
+	ret = __drm_mode_atomic_ioctl(dev, data, file_priv);
+	pm_qos_remove_request(&req);
 
 	return ret;
 }
